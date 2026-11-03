@@ -138,7 +138,7 @@ const LAYOUTS: [(Layout, bool, &str); 7] = [
     (Layout::Original, false, "Original size"),
 ];
 const CAPS: [u32; 3] = [20, 30, 60];
-const RESOLUTIONS: [f32; 11] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5];
+const RESOLUTIONS: [f32; 13] = [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5];
 /// the languages and regions in cfg's order.
 const LANGUAGES: [&str; 12] = ["Japanese", "English", "French", "German", "Italian", "Spanish", "Chinese (simplified)", "Korean", "Dutch", "Portuguese", "Russian", "Chinese (traditional)"];
 const REGIONS: [&str; 7] = ["Japan", "USA", "Europe", "Australia", "China", "Korea", "Taiwan"];
@@ -349,8 +349,8 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
 fn help(field: Field, profile: &Profile) -> &str {
     match field {
         Field::Layout => "Where the screens go. A tap of L2 swaps them, FN or L3 with R1 switch to one big screen.",
-        Field::Aspect => "The screens' shape: as on the 3DS, by whole pixels, 4:3, 16:10, 16:9, stretched, or the top one's sides cropped.",
-        Field::Resolution => "How sharp the 3D is drawn, times the 3DS's own. Higher takes more GPU. Restart the game for it.",
+    Field::Aspect => "The screens' shape: as on the 3DS, scaled by whole pixels, 4:3, 16:10, 16:9, stretched, or the top one's sides cropped.",
+    Field::Resolution => "How sharp the 3D is drawn, times the 3DS's own. Lower is softer but takes less GPU; higher is sharper and takes more GPU. Restart the game for it.",
         Field::Smooth => "Smooths the picture as it is scaled up. Off is sharper, with uneven pixels.",
         Field::Stretch => "With a screen on each display, the screens stretched over theirs: no bars, but out of shape.",
         Field::Interpolate => "Fills in pictures halfway between a game's, up to 30 or 60 a second. 30 costs half as much GPU time.",

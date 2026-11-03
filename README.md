@@ -197,6 +197,7 @@ details. It's off by default.
 | Path | What's in it |
 |---|---|
 | `engine/` | The Zakuro emulator: CPU, GPU, file systems, system services |
+| `docs/engine.md` | Engine crate/module map and the title-to-frame execution path |
 | `engine/gpu/src/raster/gles.rs` | The OpenGL ES renderer: surfaces, textures, draws and transfers |
 | `engine/gpu/src/raster/gles/` | Its parts: the GLSL (`sources.rs`), building programs and the compiler threads (`programs.rs`), getting pictures onto the panels (`display.rs`) |
 | `recompiler/` | 3dsrecomp, which turns a game's code into C |

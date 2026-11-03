@@ -1552,7 +1552,7 @@ pub struct Gles {
     /// drawn at, 4 native.
     quarters: u32,
     /// textures and framebuffers the console's size, by depth or not and
-    /// size, which a surface drawn bigger goes through to and from memory.
+    /// size, which a surface at a non-native scale goes through to and from memory.
     natives: rustc_hash::FxHashMap<(bool, u32, u32), (glow::Texture, glow::Framebuffer)>,
 }
 
@@ -1818,22 +1818,38 @@ impl Gles {
     }
 
     /// the scale pictures read back come at: always the console's own, the
-    /// surfaces drawn bigger are brought down to it.
+    /// surfaces drawn at another scale are brought to it.
     pub fn scale(&self) -> u32 {
         1
     }
 
+    fn quarters_for_scale(scale: f32) -> u32 {
+        (scale * 4.0).round().clamp(2.0, 16.0) as u32
+    }
+
+    fn scaled_length(length: u32, quarters: u32) -> u32 {
+        length * quarters / 4
+    }
+
+    fn scaled_extent(length: u32, quarters: u32) -> u32 {
+        Self::scaled_length(length, quarters).max(1)
+    }
+
     /// draws at scale times the console's resolution from now on, in
-    /// quarters from 1 to 4, and says what it draws at.
+    /// quarters from 0.5 to 4, and says what it draws at.
     pub fn set_scale(&mut self, scale: f32) -> f32 {
-        self.quarters = (scale * 4.0).round().clamp(4.0, 16.0) as u32;
+        self.quarters = Self::quarters_for_scale(scale);
         self.quarters as f32 / 4.0
     }
 
     /// a length of the console's in the surfaces' pixels: whole for any
     /// multiple of 4, as every tile and surface edge is.
     fn up(&self, length: u32) -> u32 {
-        length * self.quarters / 4
+        Self::scaled_length(length, self.quarters)
+    }
+
+    fn up_extent(&self, length: u32) -> u32 {
+        Self::scaled_extent(length, self.quarters)
     }
 
     fn scaled(&self) -> bool {
@@ -1878,7 +1894,7 @@ impl Gles {
         let (from, to) = if up { (native.1, surface) } else { (surface, native.1) };
         let mask = if depth { glow::DEPTH_BUFFER_BIT | glow::STENCIL_BUFFER_BIT } else { glow::COLOR_BUFFER_BIT };
         disturb();
-        let (big_width, small_width) = (self.up(width) as i32, width as i32);
+        let (scaled_width, native_width) = (self.up_extent(width) as i32, width as i32);
         let gl = &self.gl;
         gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(from));
         gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(to));
@@ -1887,8 +1903,8 @@ impl Gles {
         gl.depth_mask(true);
         gl.stencil_mask(0xFF);
         for &(bottom, count) in rows {
-            let (small, big) = ([0, bottom as i32, small_width, (bottom + count) as i32], [0, self.up(bottom) as i32, big_width, self.up(bottom + count) as i32]);
-            let (a, b) = if up { (small, big) } else { (big, small) };
+            let (native, scaled) = ([0, bottom as i32, native_width, (bottom + count) as i32], [0, self.up(bottom) as i32, scaled_width, self.up(bottom + count) as i32]);
+            let (a, b) = if up { (native, scaled) } else { (scaled, native) };
             gl.blit_framebuffer(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], mask, glow::NEAREST);
         }
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -1931,7 +1947,7 @@ impl Gles {
     /// the drawing and how many rows of memory come before it, which the
     /// copy takes from memory as they are.
     fn texture_over_drawing(&self, texture: &DrawnTexture) -> Option<(usize, u32)> {
-        // above the console's resolution this stays with memory for now
+        // at a non-native scale this stays with memory for now
         if self.scaled() {
             return None;
         }
@@ -2070,7 +2086,7 @@ impl Gles {
             return Ok((copiers, copy));
         }
         let (copy, framebuffer) = (self.texture_name()?, self.framebuffer_name()?);
-        let (gl, width, height) = (self.gl, self.up(texture.width) as i32, self.up(texture.height) as i32);
+        let (gl, width, height) = (self.gl, self.up_extent(texture.width) as i32, self.up_extent(texture.height) as i32);
         self.worker.post_keeping(move || {
             disturb();
             // SAFETY: on the GL thread, the names are new and the copy is the
@@ -2186,7 +2202,7 @@ impl Gles {
         }
         let (kind, image) = (surface.kind, surface.texture);
         let base = self.up(surface.height) as i32 - 1 - self.up(row) as i32;
-        let (width, height) = (self.up(texture.width) as i32, self.up(texture.height) as i32);
+        let (width, height) = (self.up_extent(texture.width) as i32, self.up_extent(texture.height) as i32);
         let opaque = matches!(texture.format, ColorFormat::Rgb8 | ColorFormat::Rgb565) as i32;
         let levels = match texture.format {
             ColorFormat::Rgba8 | ColorFormat::Rgb8 => [255.0; 4],
@@ -2438,8 +2454,7 @@ impl Gles {
         if *CPU.get_or_init(cpu) {
             return Ok(false);
         }
-        // above the console's resolution these stay with the CPU for now
-        if size == 0 || self.scaled() {
+        if size == 0 {
             return Ok(false);
         }
         let Some((addr, width, column, copy, output_width, format)) = self.surfaces.iter().find_map(|s| {
@@ -2634,8 +2649,7 @@ impl Gles {
     /// into their parts of the output, rather than the drawing being read
     /// back for the CPU.
     fn transfer_below_memory<M: GpuMemory>(&mut self, memory: &mut M, t: &Transfer) -> Result<bool, String> {
-        // above the console's resolution this stays with the CPU for now
-        if self.scaled() || t.flip || t.input_linear || t.column != 0 {
+        if t.flip || t.input_linear || t.column != 0 {
             return Ok(false);
         }
         let (input_kind, output_kind) = (Kind::Color(t.input_format), Kind::Color(t.output_format));
@@ -2688,6 +2702,8 @@ impl Gles {
         };
         let gl = self.gl;
         let t = t.clone();
+        let quarters = self.quarters;
+        let up = move |length: u32| length * quarters / 4;
         // each part: its source, the source's height, and the output rows
         // it fills, from and how many
         let (memory_rows, drawing) = ((self.surfaces[memory_rows].texture, lead), (self.surfaces[drawing].texture, size.1));
@@ -2719,11 +2735,19 @@ impl Gles {
                 if count == 0 {
                     continue;
                 }
-                pair("size", t.copy.0, count);
-                int("source_height", height as i32);
-                int("target_row", first as i32);
+                let target_row = up(first);
+                // Scale shared boundaries independently so adjacent parts stay contiguous.
+                let scaled_count = up(first + count) - target_row;
+                if scaled_count == 0 {
+                    continue;
+                }
+                pair("size", up(t.copy.0), scaled_count);
+                int("input_height", up(t.input_height) as i32);
+                int("output_height", up(t.output_height) as i32);
+                int("source_height", up(height) as i32);
+                int("target_row", target_row as i32);
                 gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
-                gl.dispatch_compute(t.copy.0.div_ceil(8), count.div_ceil(8), 1);
+                gl.dispatch_compute(up(t.copy.0).div_ceil(8), scaled_count.div_ceil(8), 1);
                 gl.memory_barrier(glow::ALL_BARRIER_BITS);
             }
         });
@@ -3130,7 +3154,7 @@ impl Gles {
         let index = match found {
             Some(index) => index,
             None => {
-                let (drawn_width, drawn_height) = (self.up(width) as i32, self.up(height) as i32);
+                let (drawn_width, drawn_height) = (self.up_extent(width) as i32, self.up_extent(height) as i32);
                 let gl = &self.gl;
                 // SAFETY: the context is current
                 let texture = unsafe {
@@ -3403,12 +3427,12 @@ impl Gles {
         self.surfaces[index].version = next_version();
         let s = &self.surfaces[index];
         let (width, height, kind, tiled, mut texture) = (s.width, s.height, s.kind, s.tiled, s.texture);
-        // drawn bigger, the pixels go into the console-size twin first
+        // at a non-native scale, pixels go through the console-size twin
         if self.scaled() {
             // SAFETY: on the GL thread, as uploads are
             match unsafe { self.native(matches!(kind, Kind::Depth(_)), width, height) } {
                 Ok((native, _)) => texture = native,
-                Err(error) => log::error!("could not upload a surface drawn bigger, {error}"),
+                Err(error) => log::error!("could not upload a surface drawn at another scale, {error}"),
             }
         }
         let s = &self.surfaces[index];
@@ -3488,7 +3512,7 @@ impl Gles {
             let rows: Vec<(u32, u32)> = ranges.iter().map(|&(from, to)| (height - to, to - from)).collect();
             // SAFETY: on the GL thread, as uploads are
             if let Err(error) = unsafe { self.through_native(index, true, &rows) } {
-                log::error!("could not upload a surface drawn bigger, {error}");
+                log::error!("could not upload a surface drawn at another scale, {error}");
             }
         }
     }
@@ -3775,7 +3799,7 @@ impl Gles {
                         let up = |length: u32| self.up(length) as i32;
                         let screen = [up(screen.rows.1), up(screen.columns), up(s.height), up(screen.rows.0)];
                         let top = index == 0;
-                        // the bottom screen too once it is drawn bigger, its pixels no longer the console's
+                        // the bottom screen too once drawn at another scale, its pixels no longer the console's
                         let smooth = smooth && (top || self.scaled());
                         parts.push(Part::Surface { texture: s.texture, screen, area, smooth, top, picture: (interpolate && top).then_some(s.version) });
                     }
@@ -3817,7 +3841,7 @@ impl Gles {
     }
 
     /// a depth surface's depth and stencil packed into color and read, from
-    /// its console-size twin when it is drawn bigger.
+    /// its console-size twin when it is drawn at another scale.
     fn read_depth(&mut self, index: usize, native: Option<glow::Texture>, data: &mut [u8]) -> Result<(), String> {
         let _timed = timed(4);
         disturb();
@@ -3934,7 +3958,7 @@ impl Gles {
                 continue;
             }
             let mut data = vec![0u8; (width * height * 4) as usize];
-            // drawn bigger, it comes down to the console's size first
+            // drawn at another scale, it comes to the console's size first
             // SAFETY: on the GL thread, as write backs are
             let native = if self.scaled() { Some(unsafe { self.through_native(index, false, &[(0, height)])? }) } else { None };
             match kind {
@@ -4692,6 +4716,23 @@ impl Gles {
 mod tests {
     use super::*;
 
+    #[test]
+    fn subnative_scales_use_quarter_steps() {
+        assert_eq!(Gles::quarters_for_scale(0.5), 2);
+        assert_eq!(Gles::quarters_for_scale(0.75), 3);
+        assert_eq!(Gles::quarters_for_scale(1.0), 4);
+        assert_eq!(Gles::quarters_for_scale(1.25), 5);
+    }
+
+    #[test]
+    fn scaled_screen_extents_match_the_selected_resolution() {
+        assert_eq!(Gles::scaled_extent(400, 2), 200);
+        assert_eq!(Gles::scaled_extent(240, 2), 120);
+        assert_eq!(Gles::scaled_extent(320, 3), 240);
+        assert_eq!(Gles::scaled_extent(240, 3), 180);
+        assert_eq!(Gles::scaled_extent(1, 2), 1);
+    }
+
     /// guest memory as one flat block from address zero.
     struct Flat(Vec<u8>);
 
@@ -5052,6 +5093,91 @@ mod tests {
         assert!(gles.surfaces.iter().any(|s| s.addr == drawing && s.dirty.is_some()));
         gles.flush(&mut memory).unwrap();
         assert_eq!(&memory.0[output as usize..output as usize + expected.len()], &expected[..], "drawing first {drawing_first}");
+    }
+
+    #[test]
+    fn subnative_texture_copies_stay_on_the_gpu() {
+        for scale in [0.5, 0.75] {
+            let mut gles = match Gles::new() {
+                Ok(gles) => gles,
+                Err(error) => {
+                    eprintln!("no OpenGL ES here, skipped: {error}");
+                    return;
+                }
+            };
+            assert_eq!(gles.set_scale(scale), scale);
+            let (source, target, width, height) = (0x1000u32, 0x8000u32, 32u32, 32u32);
+            let format = ColorFormat::Rgba8;
+            let size = width * height * 4;
+            let tile_rows = 8 * width * 4;
+            let mut memory = Flat(vec![0; 0x20000]);
+            memory.0[source as usize..(source + size) as usize].fill(0xFF);
+            let surface = gles.surface_rows(&mut memory, source, (width, height), Kind::Color(format), true, None).unwrap();
+            gles.surfaces[surface].drew((0, height));
+
+            assert!(gles.texture_copy(&mut memory, source + tile_rows, target, 2 * tile_rows, (0, 0), (0, 0)).unwrap());
+            assert!(gles.surfaces[surface].dirty.is_some());
+            gles.flush(&mut memory).unwrap();
+            let expected = vec![0xFF; (2 * tile_rows) as usize];
+            assert_eq!(&memory.0[target as usize..(target + 2 * tile_rows) as usize], &expected[..]);
+        }
+    }
+
+    #[test]
+    fn subnative_mixed_transfers_stay_on_the_gpu() {
+        for scale in [0.5, 0.75] {
+            for drawing_first in [false, true] {
+                let mut gles = match Gles::new() {
+                    Ok(gles) => gles,
+                    Err(error) => {
+                        eprintln!("no OpenGL ES here, skipped: {error}");
+                        return;
+                    }
+                };
+                assert_eq!(gles.set_scale(scale), scale);
+                let (input, output, width, lead, drawn) = (0x100000u32, 0x110000u32, 32u32, 16u32, 32u32);
+                let format = ColorFormat::Rgba8;
+                let mut memory = Flat(vec![0; 0x120000]);
+                for y in 0..lead + drawn {
+                    let in_drawing = if drawing_first { y < drawn } else { y >= lead };
+                    let value = if in_drawing { 0 } else { 0xFF };
+                    for x in 0..width {
+                        let at = input as usize + pixel_offset(true, x, y, width, 4);
+                        memory.0[at..at + 4].fill(value);
+                    }
+                }
+                let drawing = if drawing_first { input } else { input + lead * width * 4 };
+                let surface = gles.surface_rows(&mut memory, drawing, (width, drawn), Kind::Color(format), true, None).unwrap();
+                gles.surfaces[surface].drew((0, drawn));
+                let (output_width, output_height) = (width / 2, (lead + drawn) / 2);
+                let transfer = Transfer {
+                    input,
+                    output,
+                    input_width: width,
+                    input_height: lead + drawn,
+                    output_width,
+                    output_height,
+                    copy: (output_width, output_height),
+                    scale: (2, 2),
+                    flip: false,
+                    input_linear: false,
+                    output_tiled: true,
+                    input_format: format,
+                    output_format: format,
+                    column: 0,
+                };
+
+                assert!(gles.display_transfer(&mut memory, &transfer).unwrap());
+                assert!(gles.surfaces[surface].dirty.is_some());
+                gles.flush(&mut memory).unwrap();
+                let expected_first = if drawing_first { 0 } else { 0xFF };
+                let expected_last = if drawing_first { 0xFF } else { 0 };
+                for (y, expected) in [(2, expected_first), (20, expected_last)] {
+                    let at = output as usize + pixel_offset(true, 2, y, output_width, 4);
+                    assert_eq!(&memory.0[at..at + 4], &[expected; 4], "scale {scale}, drawing first {drawing_first}, row {y}");
+                }
+            }
+        }
     }
 
     #[test]

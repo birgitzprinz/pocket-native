@@ -53,7 +53,7 @@ pub struct Config {
     /// software rasterizer drawing them.
     pub software_draws: bool,
     /// how many times the console's resolution the host's GPU draws at, in
-    /// quarters from 1 to 4.
+    /// quarters from 0.5 to 4.
     pub resolution: f32,
     /// the time the console's clock starts at, in milliseconds since 1900,
     /// the host's when none, a fixed one makes runs repeat exactly.

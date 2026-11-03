@@ -990,9 +990,10 @@ impl Gpu {
 
     /// draws on the host's GPU from now on, rather than in software, and
     /// says which GPU that is.
-    /// scale is how many times the console's resolution it draws at, for
-    /// sharper pictures. on the device of a Vulkan presenter, when it gives
-    /// one, the screens are shown straight from the images drawn.
+    /// scale is how many times the console's resolution it draws at; below
+    /// native is softer and uses less GPU work. on the device of a Vulkan
+    /// presenter, when it gives one, the screens are shown straight from the
+    /// images drawn.
     #[cfg(feature = "gles")]
     pub fn enable_hardware_renderer(&mut self, scale: f32) -> Result<String, String> {
         let mut hardware = raster::gles::Gles::new()?;

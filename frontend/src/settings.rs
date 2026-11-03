@@ -144,7 +144,7 @@ pub struct Settings {
     pub stretched: Stretch,
     pub aspect: Aspect,
     /// how many times the console's resolution the GPU draws at, in
-    /// quarters from 1 to 3.5, from the next start.
+    /// quarters from 0.5 to 3.5, from the next start.
     pub resolution: f32,
     /// pictures a second the panel is filled up to with ones halfway
     /// between each two of the top screen's, 30 or 60, 0 for none.
