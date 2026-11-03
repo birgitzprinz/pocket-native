@@ -1,15 +1,18 @@
 # build.ps1 [rom...] [-Keys aes_keys.txt] [-Out folder]
+# build.ps1 -BinaryOnly [-Out folder]
 #
 # build.sh for Windows: builds Pocket Native and games for the handheld from
 # your own ROMs, .3ds/.cci or .cia files, compressed (.zcci/.zcia) or not,
 # with your console's aes_keys.txt where they are encrypted, inside a
 # container (Docker Desktop or Podman). With no ROM it asks for them. Leaves
 # "Pocket Native" in the output folder, build\ by default, to copy into
-# roms\ports on the card.
+# roms\ports on the card. -BinaryOnly builds just the frontend and engine to
+# build\pocket-native, without compiling or packaging a game.
 param(
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)][string[]]$Rom = @(),
     [string]$Keys = "",
-    [string]$Out = ""
+    [string]$Out = "",
+    [switch]$BinaryOnly
 )
 
 $repo = Split-Path -Parent $PSScriptRoot
@@ -28,7 +31,11 @@ function Pick($title, $filter, $many) {
     return $dialog.FileNames
 }
 
-if ($Rom.Count -eq 0) {
+if ($BinaryOnly -and ($Rom.Count -gt 0 -or $Keys)) {
+    Write-Host "-BinaryOnly cannot be combined with ROMs or -Keys"
+    exit 2
+}
+if (-not $BinaryOnly -and $Rom.Count -eq 0) {
     $Rom = @(Pick "Pick the games to build" "3DS games (*.3ds;*.cci;*.cia;*.zcci;*.zcia)|*.3ds;*.cci;*.cia;*.zcci;*.zcia|All files|*.*" $true)
     if ($Rom.Count -eq 0) {
         Write-Host "no game picked"
@@ -83,6 +90,15 @@ if ($LASTEXITCODE -ne 0) {
     Write-Host "== making the build container, once"
     & $engine build -f (Join-Path $repo "scripts\container\Containerfile") -t $image (Join-Path $repo "scripts\container")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+if ($BinaryOnly) {
+    & $engine run --rm -v "${repo}:/src:ro" -v "pocket-native-work:/work" -v "${Out}:/out" `
+        -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work `
+        $image bash /src/scripts/container/inside.sh --binary-only
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Host "== done: $Out\pocket-native"
+    exit 0
 }
 
 $failed = @()

@@ -8,9 +8,18 @@ set -euo pipefail
 # at build time rather than shipped
 FONT_URL=https://raw.githubusercontent.com/azahar-emu/azahar/c9e1e946a0b5d30a58ae14dee83c1f203a49622d/externals/open_source_archives/include/shared_font.app.romfs.h
 
+cd /src
+
+if [[ "${1:-}" == --binary-only ]]; then
+    echo "== building the Pocket Native frontend and engine"
+    cargo build --release --locked --target aarch64-unknown-linux-gnu -p pocket-native
+    mkdir -p /out
+    aarch64-linux-gnu-strip -o /out/pocket-native "$CARGO_TARGET_DIR/aarch64-unknown-linux-gnu/release/pocket-native"
+    exit 0
+fi
+
 rom="$1"
 keys="${2:-}"
-cd /src
 
 # a Z3DS-compressed .zcci/.zcia is its zstd stream after the header and
 # the metadata, whose sizes the header gives

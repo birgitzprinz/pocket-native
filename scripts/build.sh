@@ -1,25 +1,34 @@
 #!/bin/bash
 # build.sh <rom>... [--keys aes_keys.txt] [--out dir] [--wait]
+# build.sh --binary-only [--out dir] [--wait]
 #
 # Builds Pocket Native and games for the handheld from your own ROMs,
 # .3ds/.cci or .cia files, compressed (.zcci/.zcia) or not, with your
 # console's aes_keys.txt where they are encrypted, inside a container
-# (podman or docker). With no ROM it asks for them, and
-# --wait waits for Enter at the end. Leaves "Pocket Native" in the output
+# (podman or docker). The normal mode asks for games if none are supplied.
+# --binary-only builds just the frontend and engine to build/pocket-native,
+# without compiling or packaging a game. --wait waits for Enter at the end.
+# Leaves "Pocket Native" in the output
 # directory, build/ by default, to copy into roms/ports on the card.
 set -euo pipefail
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-roms=() keys="" out="$repo/build"
+roms=() keys="" out="$repo/build" binary_only=0
 while [ $# -gt 0 ]; do
     case "$1" in
+        --binary-only) binary_only=1; shift ;;
         --keys) keys="$(realpath "$2")"; shift 2 ;;
         --out) out="$(realpath -m "$2")"; shift 2 ;;
         --wait) trap 'code=$?; read -rp "press Enter to close " _ || true; exit $code' EXIT; shift ;;
-        -h|--help) sed -n '2,8p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
         *) roms+=("$(realpath -m "$1")"); shift ;;
     esac
 done
+
+if (( binary_only )) && { (( ${#roms[@]} > 0 )) || [ -n "$keys" ]; }; then
+    echo "--binary-only cannot be combined with ROMs or --keys"
+    exit 2
+fi
 
 # a file picker from the desktop's own toolkit, one path a line
 pick() {
@@ -31,12 +40,13 @@ pick() {
     fi
 }
 
-if [ ${#roms[@]} -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+if (( ! binary_only )) && [ ${#roms[@]} -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
     mapfile -t roms < <(pick "Pick the games to build" "3DS games" "*.3ds *.cci *.cia *.zcci *.zcia *.3DS *.CCI *.CIA *.ZCCI *.ZCIA" many || true)
     [ ${#roms[@]} -eq 0 ] && { echo "no game picked"; exit 2; }
 fi
-if [ ${#roms[@]} -eq 0 ]; then
+if (( ! binary_only )) && [ ${#roms[@]} -eq 0 ]; then
     echo "usage: scripts/build.sh <rom>... [--keys aes_keys.txt] [--out dir]"
+    echo "       scripts/build.sh --binary-only [--out dir]"
     exit 2
 fi
 for rom in "${roms[@]}"; do
@@ -52,6 +62,16 @@ fi
 mkdir -p "$out/.work"
 user=(--user "$(id -u):$(id -g)")
 [ "$(basename "$engine")" = podman ] && user=(--userns=keep-id)
+
+if (( binary_only )); then
+    "$engine" run --rm "${user[@]}" \
+        -v "$repo:/src:ro,Z" -v "$out/.work:/work" -v "$out:/out" \
+        -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work \
+        "$image" bash /src/scripts/container/inside.sh --binary-only
+    echo "== done: $out/pocket-native"
+    exit 0
+fi
+
 failed=()
 for rom in "${roms[@]}"; do
     mounts=(-v "$repo:/src:ro,Z" -v "$out/.work:/work" -v "$out:/out" -v "$(dirname "$rom"):/rom:ro,Z")
