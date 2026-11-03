@@ -59,6 +59,8 @@ pub struct Pad {
     /// set once a gamepad is used, which hides the touch controls until a
     /// finger is on the screen again.
     pub pad_used: bool,
+    /// the attached gamepad is an RG351P/M OSH PB controller.
+    pub osh_pb: bool,
     /// a finger on a second window's screen, across and down it from 0 to 1.
     pub second_touch: Option<(f32, f32)>,
 }
@@ -129,6 +131,16 @@ fn miyoo_pad(name: &str) -> bool {
     name.trim_matches('"').starts_with("MIYOO Player")
 }
 
+/// the RG351P/M's internal USB gamepad.
+pub fn osh_pb_pad(name: &str) -> bool {
+    name == "OpenSimHardware OSH PB Controller"
+}
+
+/// whether Start with the function button, or the OSH PB's Select, exits.
+pub fn exit_combo(keys: &HashSet<u16>, start_pressed: bool, osh: bool) -> bool {
+    start_pressed && (keys.contains(&FN) || keys.contains(&L3) || osh && keys.contains(&SELECT))
+}
+
 pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     // muOS calls its pad muOS-Keys: on its release the kernel's, numbered as
     // on the H700 handhelds, and from the next one a pad muOS makes itself,
@@ -144,12 +156,14 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     // the RK3562 handhelds give them the usual numbers too, with the
     // sticks on the usual axes
     let rk3562 = rk3562_pad(&name);
+    let osh_pb = osh_pb_pad(&name);
     let miyoo = miyoo_pad(&name);
     RADIAL.store(miyoo, std::sync::atomic::Ordering::Relaxed);
     // any other pad numbering select and start the usual way, as ROCKNIX's
     // drivers do, its R36S's r36s_Gamepad among them
     let keys = std::fs::read_to_string(format!("/sys/class/input/{event}/device/capabilities/key")).unwrap_or_default();
-    let usual = rk3566 || !h700 && !rk3562 && !muos && !miyoo && usual_numbers(&keys);
+    let usual = rk3566 || !h700 && !rk3562 && !muos && !miyoo && !osh_pb && usual_numbers(&keys);
+    pad.lock().unwrap().osh_pb = osh_pb;
     log::info!(
         "buttons from {name}{}",
         if h700 {
@@ -158,6 +172,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             ", numbered as on Anbernic's RK3566 handhelds"
         } else if rk3562 {
             ", numbered as on the RK3562 handhelds"
+        } else if osh_pb {
+            ", numbered as on the RG351P/M OSH PB controller"
         } else if muos {
             ", numbered as on muOS"
         } else if miyoo {
@@ -170,6 +186,9 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     );
     // the R36S's stick each of axes 0 to 5 is, scaled to its travel
     let sticks = if h700 {
+        // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
+        Some([None, None, Some(0), Some(1), Some(3), Some(4)])
+    } else if osh_pb {
         // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if rk3566 {
@@ -229,6 +248,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         rk3566_button(code)
                     } else if rk3562 {
                         rk3562_button(code)
+                    } else if osh_pb {
+                        osh_pb_button(code)
                     } else if muos {
                         muos_button(code)
                     } else {
@@ -261,11 +282,17 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                     }
                 }
                 (3, Some(sticks)) => {
-                    if let Some(axis) = sticks.get(code as usize).copied().flatten() {
-                        pad.axes[axis] = match ranges[code as usize] {
+                    let mapped = if osh_pb {
+                        osh_pb_axis(code)
+                    } else {
+                        sticks.get(code as usize).copied().flatten().map(|axis| (axis, false))
+                    };
+                    if let Some((axis, inverted)) = mapped {
+                        let value = match ranges[code as usize] {
                             Some((least, most)) => ((2 * value - least - most) as f32 / (most - least) as f32 * STICK) as i32,
                             None => value,
                         };
+                        pad.axes[axis] = if inverted { value.saturating_neg() } else { value };
                     }
                 }
                 (3, None) if (code as usize) < pad.axes.len() => {
@@ -399,6 +426,36 @@ fn h700_button(code: u16) -> u16 {
         315 => R2,
         316 => R3,
         other => other,
+    }
+}
+
+/// An RG351P/M's OSH PB controller button as the R36S numbers it.
+fn osh_pb_button(code: u16) -> u16 {
+    match code {
+        304 => A,
+        305 => B,
+        306 => X,
+        307 => Y,
+        308 => L1,
+        309 => R1,
+        310 => START,
+        311 => SELECT,
+        312 => L3,
+        313 => R3,
+        314 => L2,
+        315 => R2,
+        other => other,
+    }
+}
+
+/// An RG351P/M's OSH PB controller axis as the R36S axes, and whether it is inverted.
+fn osh_pb_axis(code: u16) -> Option<(usize, bool)> {
+    match code {
+        2 => Some((0, true)),
+        3 => Some((1, true)),
+        4 => Some((3, false)),
+        5 => Some((4, false)),
+        _ => None,
     }
 }
 
@@ -604,7 +661,41 @@ pub fn cursor_step(speed: Speed) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::sticks_in_order;
+    use super::{exit_combo, osh_pb_axis, osh_pb_button, osh_pb_pad, sticks_in_order, A, B, FN, L1, L2, L3, R1, R2, R3, SELECT, START, X, Y};
+    use std::collections::HashSet;
+
+    #[test]
+    fn exit_combo_keeps_existing_shortcuts_and_adds_osh_pb_select() {
+        assert!(exit_combo(&HashSet::from([FN]), true, false));
+        assert!(exit_combo(&HashSet::from([L3]), true, false));
+        assert!(exit_combo(&HashSet::from([SELECT]), true, true));
+        assert!(!exit_combo(&HashSet::from([SELECT]), true, false));
+        assert!(!exit_combo(&HashSet::from([SELECT]), false, true));
+    }
+
+    #[test]
+    fn osh_pb_buttons_match_the_r36s_codes() {
+        assert_eq!(
+            [304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314, 315].map(osh_pb_button),
+            [A, B, X, Y, L1, R1, START, SELECT, L3, R3, L2, R2]
+        );
+        assert_eq!(osh_pb_button(316), 316);
+    }
+
+    #[test]
+    fn osh_pb_axes_match_the_r36s_axes_and_inversion() {
+        assert_eq!(osh_pb_axis(2), Some((0, true)));
+        assert_eq!(osh_pb_axis(3), Some((1, true)));
+        assert_eq!(osh_pb_axis(4), Some((3, false)));
+        assert_eq!(osh_pb_axis(5), Some((4, false)));
+        assert_eq!(osh_pb_axis(0), None);
+    }
+
+    #[test]
+    fn recognizes_the_osh_pb_device_name() {
+        assert!(osh_pb_pad("OpenSimHardware OSH PB Controller"));
+        assert!(!osh_pb_pad("retrogame_joypad"));
+    }
 
     #[test]
     fn sticks_follow_the_axes_a_pad_has() {
