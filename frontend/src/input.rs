@@ -273,13 +273,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         pad.keys.remove(&key);
                     }
                 }
-                (3, _) if (h700 || muos || usual || miyoo) && matches!(code, 16 | 17) => {
-                    let (less, more) = if code == 16 { (LEFT, RIGHT) } else { (UP, DOWN) };
-                    pad.keys.remove(&less);
-                    pad.keys.remove(&more);
-                    if value != 0 {
-                        pad.keys.insert(if value < 0 { less } else { more });
-                    }
+                (3, _) if (h700 || muos || usual || miyoo || osh_pb) && matches!(code, 16 | 17) => {
+                    set_hat_dpad(&mut pad.keys, code, value);
                 }
                 (3, Some(sticks)) => {
                     let mapped = if osh_pb {
@@ -408,6 +403,15 @@ pub fn read_touch(path: String, bottom: bool, pad: Arc<Mutex<Pad>>) {
             }
         }
     });
+}
+
+fn set_hat_dpad(keys: &mut HashSet<u16>, code: u16, value: i32) {
+    let (less, more) = if code == 16 { (LEFT, RIGHT) } else { (UP, DOWN) };
+    keys.remove(&less);
+    keys.remove(&more);
+    if value != 0 {
+        keys.insert(if value < 0 { less } else { more });
+    }
 }
 
 /// an H700 handheld's button as the R36S numbers it.
@@ -661,7 +665,7 @@ pub fn cursor_step(speed: Speed) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_combo, osh_pb_axis, osh_pb_button, osh_pb_pad, sticks_in_order, A, B, FN, L1, L2, L3, R1, R2, R3, SELECT, START, X, Y};
+    use super::{exit_combo, osh_pb_axis, osh_pb_button, osh_pb_pad, set_hat_dpad, sticks_in_order, A, B, DOWN, FN, L1, L2, L3, LEFT, RIGHT, R1, R2, R3, SELECT, START, UP, X, Y};
     use std::collections::HashSet;
 
     #[test]
@@ -695,6 +699,22 @@ mod tests {
     fn recognizes_the_osh_pb_device_name() {
         assert!(osh_pb_pad("OpenSimHardware OSH PB Controller"));
         assert!(!osh_pb_pad("retrogame_joypad"));
+    }
+
+    #[test]
+    fn hat_dpad_axes_update_and_release_directions() {
+        let mut keys = HashSet::new();
+        set_hat_dpad(&mut keys, 16, -1);
+        assert!(keys.contains(&LEFT));
+        set_hat_dpad(&mut keys, 16, 1);
+        assert!(!keys.contains(&LEFT));
+        assert!(keys.contains(&RIGHT));
+        set_hat_dpad(&mut keys, 17, -1);
+        assert!(keys.contains(&UP));
+        set_hat_dpad(&mut keys, 17, 0);
+        assert!(!keys.contains(&UP));
+        assert!(!keys.contains(&DOWN));
+        assert!(keys.contains(&RIGHT));
     }
 
     #[test]
