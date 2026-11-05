@@ -675,12 +675,20 @@ impl Gpu {
         // else go on, the title may be waiting for what they bring. a
         // transfer reaches a screen when it overlaps a buffer the screen was
         // given, some titles starting it a few rows before the buffer
+        let downscale = (flags >> 24) & 3;
+        let (scale_x, scale_y) = match downscale {
+            1 => (2u32, 1u32),
+            2 => (2, 2),
+            _ => (1, 1),
+        };
+        let output_width = (output_dimensions & 0xFFFF) / scale_x;
+        let output_height = (output_dimensions >> 16) / scale_y;
         let output_bytes = match (flags >> 12) & 7 {
             0 => 4,
             1 => 3,
             _ => 2,
         };
-        let output_end = output_paddr as u64 + (output_dimensions & 0xFFFF) as u64 * (output_dimensions >> 16) as u64 * output_bytes;
+        let output_end = output_paddr as u64 + output_width as u64 * output_height as u64 * output_bytes;
         let reached = self.on_screen(memory, output_paddr, (output_end - output_paddr as u64) as u32);
         if let Some((screen, buffer)) = reached {
             self.stale[screen].retain(|&stale| stale != buffer);
@@ -778,20 +786,11 @@ impl Gpu {
         let output_tiled = input_linear != (flags & (1 << 5) != 0);
         let input_format = ColorFormat::from_raw((flags >> 8) & 7);
         let output_format = ColorFormat::from_raw((flags >> 12) & 7);
-        let downscale = (flags >> 24) & 3;
 
         let input_bpp = input_format.bytes_per_pixel();
         let output_bpp = output_format.bytes_per_pixel();
 
-        let (scale_x, scale_y) = match downscale {
-            1 => (2u32, 1u32),
-            2 => (2, 2),
-            _ => (1, 1),
-        };
         // the output's size counts input pixels, a downscale shrinks it
-        let output_width = (output_dimensions & 0xFFFF) / scale_x;
-        let output_height = (output_dimensions >> 16) / scale_y;
-
         let copy_width = output_width.min(input_width / scale_x);
         let copy_height = output_height.min(input_height / scale_y);
 
@@ -2083,6 +2082,19 @@ mod tests {
         gpu.display_transfer(&mut memory, 0x100, 0x180, 4 | (2 << 16), 4 | (2 << 16), flags);
         let red_at = |i: usize| ColorFormat::Rgba8.decode(&memory.0[0x180 + i * 4..0x184 + i * 4])[0];
         assert_eq!([red_at(0), red_at(1)], [50, 100]);
+    }
+
+    #[test]
+    fn a_downscaled_transfer_does_not_reach_a_screen_past_its_output() {
+        let mut memory = FlatMemory(vec![0; 0x300]);
+        let mut gpu = Gpu::new();
+        gpu.framebuffers[0].stride = 960;
+        gpu.screen_buffers.push((0, 0x110));
+
+        let flags = (1 << 1) | (1 << 5) | (2 << 24);
+        gpu.display_transfer(&mut memory, 0x40, 0x100, 4 | (2 << 16), 4 | (2 << 16), flags);
+
+        assert_eq!(gpu.top_pictures, 0, "the written 2x1 output ends before the top buffer");
     }
 
     #[test]
