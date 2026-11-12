@@ -149,16 +149,6 @@ pub fn exit_combo(keys: &HashSet<u16>, start_pressed: bool, osh: bool) -> bool {
     start_pressed && (keys.contains(&FN) || keys.contains(&L3) || osh && keys.contains(&SELECT))
 }
 
-/// the RG351P/M's internal USB gamepad.
-pub fn osh_pb_pad(name: &str) -> bool {
-    name == "OpenSimHardware OSH PB Controller"
-}
-
-/// whether Start with the function button, or the OSH PB's Select, exits.
-pub fn exit_combo(keys: &HashSet<u16>, start_pressed: bool, osh: bool) -> bool {
-    start_pressed && (keys.contains(&FN) || keys.contains(&L3) || osh && keys.contains(&SELECT))
-}
-
 pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     // muOS calls its pad muOS-Keys: on its release the kernel's, numbered as
     // on the H700 handhelds, and from the next one a pad muOS makes itself,
@@ -204,9 +194,6 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     );
     // the R36S's stick each of axes 0 to 5 is, scaled to its travel
     let sticks = if h700 || osh_pb {
-        // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
-        Some([None, None, Some(0), Some(1), Some(3), Some(4)])
-    } else if osh_pb {
         // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if rk3566 {
