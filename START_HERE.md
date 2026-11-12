@@ -22,7 +22,8 @@ Before you start, check [which games work](docs/compatibility.md),
   - a Linux handheld from the [list](README.md#handhelds), or
   - an Android phone or handheld with Android 11 or newer, 64-bit (almost
     any from the last few years)
-- **A PC** with Windows or Linux. It does the heavy work, your device
+- **A PC** with Windows or Linux and an Intel or AMD processor: the
+  build doesn't run on ARM yet. It does the heavy work, your device
   never builds anything.
   - Windows: Docker Desktop or Podman Desktop. If neither is
     installed, the build offers to install Docker Desktop for you.
@@ -70,7 +71,11 @@ Prefer a terminal? In the kit's folder:
 scripts/build.sh path/to/game.3ds path/to/other.cia --keys path/to/aes_keys.txt
 ```
 
-or `scripts\build.ps1` in PowerShell on Windows (`-Keys` for the keys).
+or on Windows, in PowerShell, with your own files' paths:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1 C:\path\to\game.3ds -Keys C:\path\to\aes_keys.txt
+```
 
 ## 3. Put the games on your device
 
@@ -215,19 +220,52 @@ manager doesn't run launchers it doesn't trust yet. Allow it when it
 asks, or in the file's properties, or run `scripts/build.sh` from a
 terminal.
 
+**PowerShell says `build.ps1` is not digitally signed.** PowerShell
+won't run scripts from the internet when started straight from it. Use
+`Build a game.bat`, or start the script with `-ExecutionPolicy Bypass`
+as above.
+
 **The Windows build can't reach Docker.** Docker Desktop isn't running.
 Start it, wait until it says it's running, and build again.
 
+**Miis have no heads, or heads with no faces (experimental).** Mii heads
+are drawn from the console's Mii parts, which are Nintendo's and can't come
+with Pocket Native. The build gets them and copies them into every game it
+builds:
+- with your console's full `aes_keys.txt` in the kit's folder (one with the
+  `slot0x3DKeyX` and `common0` lines), it downloads them from Nintendo's
+  update servers and opens them with your keys, as a 3DS gets its system
+  data;
+- a `CFL_Res.dat` from your own console, or the `00000000.app.romfs` Citra
+  and Azahar keep them in (`nand/.../title/0004009b/00010202/content/`), put
+  in the kit's folder, works too, as does a game you build that carries
+  them (Animal Crossing: New Leaf does).
+
+Without them, Miis get an open-source placeholder head with no face. After
+adding them, run `Rebuild all games` and copy the folder onto the card again.
+This is experimental and may not work in every game. The game's log says
+which head it used, so if your Miis look wrong, please send it.
+
 **The build says the game is encrypted.** Put your console's
 `aes_keys.txt` next to the game or in the kit's folder and build again,
-or decrypt the dump first (GodMode9: Decrypt file).
+or decrypt the dump first (GodMode9: Decrypt file). An eShop game's
+`.cia` is encrypted with its title key too: that needs the full
+`aes_keys.txt`, with the `slot0x3DKeyX` and `common0` lines.
+
+**The build stops with `KeyError: 'generator'` or another key's name,
+or says your aes_keys.txt has no line for one.** Your aes_keys.txt is
+missing keys. It needs a `generator=` line and a `slot0x2CKeyX=` line,
+and newer games need `slot0x25KeyX`, `slot0x18KeyX` or `slot0x1BKeyX`
+too. Dump it from your console again, or decrypt the game first
+(GodMode9: Decrypt file) and build it without keys.
 
 **The build stops with "Killed" (`Killed signal terminated program
 cc1`).** The PC, or Docker's share of it, ran out of memory while
-compiling. Each compiler takes about a gigabyte: from 0.5.0 the build
-runs only as many at once as memory has room for. Before that, close
-other programs, or give Docker Desktop more memory or fewer CPUs in
-Settings > Resources, and build again.
+compiling. Each compiler takes about a gigabyte: the build starts only
+as many at once as memory has room for, and when one runs out anyway it
+goes again with fewer at once, so a "Killed" line on its own is fine. If
+the build stops even so, close other programs, or give Docker Desktop
+more memory in Settings > Resources, and build again.
 
 **The update can't reach GitHub.** Check the PC's connection and try
 again, or get the new kit by hand as in step 1.

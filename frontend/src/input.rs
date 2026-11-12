@@ -63,6 +63,8 @@ pub struct Pad {
     pub osh_pb: bool,
     /// a finger on a second window's screen, across and down it from 0 to 1.
     pub second_touch: Option<(f32, f32)>,
+    /// the device's own motion sensors, as InputState's motion has them.
+    pub motion: Option<([f32; 3], [f32; 3])>,
 }
 
 /// the pad a program around the frontend fills, in place of evdev's.
@@ -89,7 +91,11 @@ pub fn shared() -> Option<Arc<Mutex<Pad>>> {
 
 /// the handheld's gamepad device and its name.
 pub fn gamepad() -> Option<(String, String)> {
-    let devices = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
+    pad_among(&std::fs::read_to_string("/proc/bus/input/devices").ok()?)
+}
+
+/// the pad in /proc/bus/input/devices' text, its event device and name.
+fn pad_among(devices: &str) -> Option<(String, String)> {
     // muOS hides the pad it reads behind its own, so that one goes first
     let mut blocks: Vec<&str> = devices.split("\n\n").collect();
     blocks.sort_by_key(|block| !block.contains("N: Name=\"muOS-Keys\""));
@@ -127,8 +133,20 @@ fn rk3562_pad(name: &str) -> bool {
 
 /// the Miyoo Flip's pad under spruceOS: the usual gamepad codes (304 to 318,
 /// no 312/313), the d-pad as a hat, the triggers only as ABS_Z and ABS_RZ.
+/// TrimUI's handhelds (the Smart Pro) give theirs the same way.
 fn miyoo_pad(name: &str) -> bool {
-    name.trim_matches('"').starts_with("MIYOO Player")
+    let name = name.trim_matches('"');
+    name.starts_with("MIYOO Player") || name.starts_with("TRIMUI Player")
+}
+
+/// the RG351P/M's internal USB gamepad.
+pub fn osh_pb_pad(name: &str) -> bool {
+    name == "OpenSimHardware OSH PB Controller"
+}
+
+/// whether Start with the function button, or the OSH PB's Select, exits.
+pub fn exit_combo(keys: &HashSet<u16>, start_pressed: bool, osh: bool) -> bool {
+    start_pressed && (keys.contains(&FN) || keys.contains(&L3) || osh && keys.contains(&SELECT))
 }
 
 /// the RG351P/M's internal USB gamepad.
@@ -177,7 +195,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
         } else if muos {
             ", numbered as on muOS"
         } else if miyoo {
-            ", numbered as on the Miyoo Flip"
+            ", numbered as on the Miyoo Flip and TrimUI's handhelds"
         } else if usual {
             ", numbered the usual way"
         } else {
@@ -185,7 +203,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
         }
     );
     // the R36S's stick each of axes 0 to 5 is, scaled to its travel
-    let sticks = if h700 {
+    let sticks = if h700 || osh_pb {
         // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if osh_pb {
@@ -560,6 +578,21 @@ pub fn parse_keys(spec: &str) -> Vec<(u64, HashSet<u16>)> {
         .collect()
 }
 
+/// a vector from an Android device's sensors, on its axes in its natural
+/// orientation, on the 3DS's instead: the device turned by rotation quarter
+/// turns, as its display reports, and held across or upright, the way
+/// Azahar turns them.
+pub fn to_3ds([x, y, z]: [f32; 3], rotation: u8, portrait: bool) -> [f32; 3] {
+    // across and up the screen as shown, out of it
+    let (across, up) = match rotation % 4 {
+        0 => (x, y),
+        1 => (y, -x),
+        2 => (-x, -y),
+        _ => (-y, x),
+    };
+    if portrait { [-across, z, up] } else { [across, z, -up] }
+}
+
 /// a stick's position from -1 to 1, nothing near the middle.
 pub fn stick(value: i32) -> f32 {
     if value.abs() < 200 { 0.0 } else { (value as f32 / STICK).clamp(-1.0, 1.0) }
@@ -665,8 +698,20 @@ pub fn cursor_step(speed: Speed) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_combo, osh_pb_axis, osh_pb_button, osh_pb_pad, set_hat_dpad, sticks_in_order, A, B, DOWN, FN, L1, L2, L3, LEFT, RIGHT, R1, R2, R3, SELECT, START, UP, X, Y};
+    use super::{exit_combo, osh_pb_axis, osh_pb_button, osh_pb_pad, pad_among, set_hat_dpad, sticks_in_order, A, B, DOWN, FN, L1, L2, L3, LEFT, RIGHT, R1, R2, R3, SELECT, START, UP, X, Y};
     use std::collections::HashSet;
+
+    #[test]
+    fn a_trimui_pad_is_found_under_spruceos() {
+        // the Smart Pro's devices under spruceOS, as a tester's log named them
+        let devices = ["sunxi-keyboard", "pwm-vibrator", "axp2202-pek", "audiocodec Headphones", "TRIMUI Player1", "Microsoft X-Box 360 pad"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| format!("I: Bus=0019 Vendor=0001 Product=0001 Version=0100\nN: Name=\"{name}\"\nH: Handlers=event{i}\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(pad_among(&devices), Some(("/dev/input/event4".to_owned(), "TRIMUI Player1".to_owned())));
+    }
 
     #[test]
     fn exit_combo_keeps_existing_shortcuts_and_adds_osh_pb_select() {
@@ -715,6 +760,22 @@ mod tests {
         assert!(!keys.contains(&UP));
         assert!(!keys.contains(&DOWN));
         assert!(keys.contains(&RIGHT));
+    }
+
+    #[test]
+    fn sensors_turn_to_the_3ds_axes() {
+        use super::to_3ds;
+        // lying on a table, screen up: out of the screen, whichever way it turned
+        for rotation in 0..4 {
+            assert_eq!(to_3ds([0.0, 0.0, 9.8], rotation, rotation % 2 == 0)[1], 9.8);
+        }
+        // held across, screen facing the player, gravity's reaction up the
+        // screen whichever way the device's natural axes lie: down the 3DS's z
+        assert_eq!(to_3ds([0.0, 9.8, 0.0], 0, false), [0.0, 0.0, -9.8]);
+        assert_eq!(to_3ds([-9.8, 0.0, 0.0], 1, false), [0.0, 0.0, -9.8]);
+        assert_eq!(to_3ds([9.8, 0.0, 0.0], 3, false), [0.0, 0.0, -9.8]);
+        // as Azahar has a phone in portrait
+        assert_eq!(to_3ds([1.0, 2.0, 3.0], 0, true), [-1.0, 3.0, 2.0]);
     }
 
     #[test]

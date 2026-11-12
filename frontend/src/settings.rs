@@ -152,6 +152,10 @@ pub struct Settings {
     pub show_fps: bool,
     /// the battery and the time under the screens.
     pub show_clock: bool,
+    /// the box while new shaders build.
+    pub show_building: bool,
+    /// the word in the top right corner while the game saves.
+    pub show_saving: bool,
     /// the picture turned onto a sideways panel, as ZAKURO_PANEL_ROTATE
     /// does, which Auto leaves to.
     pub rotation: Rotation,
@@ -187,6 +191,8 @@ impl Default for Settings {
             interpolate_to: 0,
             show_fps: false,
             show_clock: true,
+            show_building: true,
+            show_saving: true,
             rotation: Rotation::Auto,
             frame_cap: 30,
             power: Power::Performance,

@@ -31,6 +31,8 @@ enum Field {
     Interpolate,
     ShowFps,
     ShowClock,
+    ShowBuilding,
+    ShowSaving,
     Rotation,
     FrameCap,
     Power,
@@ -174,7 +176,7 @@ fn sections(page: Page, profile: &Profile) -> Vec<(&'static str, Vec<Field>)> {
     let only = |fields: Vec<Field>| fields.into_iter().filter(|&field| useful(field)).collect();
     match page {
         Page::Main => vec![
-            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::Rotation])),
+            ("Display", only(vec![Field::Layout, Field::Aspect, Field::Resolution, Field::Smooth, Field::Stretch, Field::Interpolate, Field::ShowFps, Field::ShowClock, Field::ShowBuilding, Field::ShowSaving, Field::Rotation])),
             ("Performance", only(vec![Field::FrameCap, Field::Power])),
             ("This game", (0..profile.options.len()).map(Field::Option).collect()),
             ("Controls", only(vec![Field::TouchSpeed, Field::Cursor, Field::Buttons, Field::LeftStick, Field::Dpad, Field::RightStick, Field::ReverseTiltX, Field::ReverseTiltY, Field::TouchControls, Field::EditControls])),
@@ -235,6 +237,8 @@ fn label(field: Field, settings: &Settings, game: &GameSettings, profile: &Profi
         Field::Interpolate => ("Frame interpolation", if settings.interpolate_to == 0 { "Off".into() } else { format!("Up to {} fps", settings.interpolate_to) }),
         Field::ShowFps => ("Show fps", if settings.show_fps { "On" } else { "Off" }.into()),
         Field::ShowClock => ("Clock and battery", if settings.show_clock { "On" } else { "Off" }.into()),
+        Field::ShowBuilding => ("Shader popup", if settings.show_building { "On" } else { "Off" }.into()),
+        Field::ShowSaving => ("Saving popup", if settings.show_saving { "On" } else { "Off" }.into()),
         Field::Rotation => {
             let rotation = match settings.rotation {
                 Rotation::Auto => "Auto",
@@ -309,6 +313,8 @@ fn change(field: Field, by: isize, settings: &mut Settings, game: &mut GameSetti
         Field::Interpolate => settings.interpolate_to = step(&[0, 30, 60], settings.interpolate_to, by),
         Field::ShowFps => settings.show_fps = !settings.show_fps,
         Field::ShowClock => settings.show_clock = !settings.show_clock,
+        Field::ShowBuilding => settings.show_building = !settings.show_building,
+        Field::ShowSaving => settings.show_saving = !settings.show_saving,
         Field::Rotation => settings.rotation = step(&[Rotation::Auto, Rotation::Clockwise, Rotation::CounterClockwise, Rotation::Off], settings.rotation, by),
         Field::FrameCap => settings.frame_cap = step(&CAPS, settings.frame_cap, by),
         Field::Power => settings.power = step(&[Power::Saver, Power::Balanced, Power::Performance], settings.power, by),
@@ -356,6 +362,8 @@ fn help(field: Field, profile: &Profile) -> &str {
         Field::Interpolate => "Fills in pictures halfway between a game's, up to 30 or 60 a second. 30 costs half as much GPU time.",
         Field::ShowFps => "Pictures a second and the temperature, in the bottom right corner.",
         Field::ShowClock => "The battery and a 12-hour clock, in the bottom left corner.",
+        Field::ShowBuilding => "The box in the top left corner while new shaders build. Off hides it, they still build.",
+        Field::ShowSaving => "The word in the top right corner while the game saves, to leave the power on. Off hides it.",
         Field::Rotation => "Turns the picture for a screen that shows it the wrong way round. Takes effect when the game starts again.",
         Field::FrameCap => "The most pictures shown a second. Lower lasts longer and runs cooler.",
         Field::Power => "How fast the CPU and GPU run. Performance is fastest and warmest, Saver lasts longest.",
@@ -595,11 +603,14 @@ pub struct Status {
     /// how many shaders are still building, at the top left, and how many
     /// of the generic stand-ins of how many, a first run's long build.
     building: Option<(usize, (usize, usize))>,
+    /// the game writing its saves, at the top right, for the power to stay
+    /// on until they reached the card.
+    pub saving: bool,
 }
 
 impl Status {
     /// none when the settings show nothing.
-    pub fn now(settings: &Settings, fps: u32, note: Option<&'static str>, building: Option<(usize, (usize, usize))>) -> Option<Status> {
+    pub fn now(settings: &Settings, fps: u32, note: Option<&'static str>, building: Option<(usize, (usize, usize))>, saving: bool) -> Option<Status> {
         let read = |path: &str| std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse::<i64>().ok());
         let status = Status {
             fps: settings.show_fps.then(|| match read("/sys/class/thermal/thermal_zone0/temp") {
@@ -609,9 +620,10 @@ impl Status {
             battery: settings.show_clock.then(battery).flatten(),
             clock: settings.show_clock.then(clock),
             note,
-            building,
+            building: building.filter(|_| settings.show_building),
+            saving: saving && settings.show_saving,
         };
-        (status.fps.is_some() || status.clock.is_some() || note.is_some() || building.is_some()).then_some(status)
+        (status.fps.is_some() || status.clock.is_some() || note.is_some() || status.building.is_some() || status.saving).then_some(status)
     }
 
     pub fn draw(&self, canvas: &mut Canvas, (width, height): (u32, u32)) {
@@ -633,6 +645,10 @@ impl Status {
             };
             canvas.fill([8.0, 8.0, 20.0 + canvas.measure(BIG, &line), 32.0], backing);
             canvas.text(BIG, &line, 14.0, 11.0, rgba(TEXT, 255), false);
+        }
+        if self.saving {
+            canvas.fill([width - 20.0 - canvas.measure(BIG, "Saving"), 8.0, width - 8.0, 32.0], backing);
+            canvas.text(BIG, "Saving", width - 14.0, 11.0, rgba(TEXT, 255), true);
         }
         if let Some(line) = &self.fps {
             canvas.fill([width - 20.0 - canvas.measure(BIG, line), top, width - 8.0, bottom], backing);

@@ -222,6 +222,8 @@ pub fn run(mut args: Vec<String>) {
     let fixed_skip: Option<u32> = std::env::var("ZAKURO_FRAMESKIP").ok().and_then(|value| value.parse().ok());
     let mut most_skipped = fixed_skip.unwrap_or(advanced.frame_skip);
     let mut shown_only = advanced.shown_only;
+    // a probe timing as a player plays leaves out the unshown frames too
+    let as_played = !probing || std::env::var_os("ZAKURO_PROBE_NO_WATCH").is_some();
     let mut skipped = 0;
     // interpolation waits for a second without skipping, it has no time then
     let mut last_skip = 0u64;
@@ -267,13 +269,13 @@ pub fn run(mut args: Vec<String>) {
     let slow: Option<f64> = std::env::var("ZAKURO_SLOW_FRAMES").ok().and_then(|ms| ms.parse().ok());
     loop {
         let began = Instant::now();
-        let (mut keys, mut axes, fingers, second_touch, pad_used, osh_pb) = {
+        let (mut keys, mut axes, fingers, second_touch, pad_used, osh_pb, motion) = {
             let mut pad = pad.lock().unwrap();
             let keys: HashSet<u16> = pad.keys.union(&pad.let_go).copied().collect();
             let fingers: Vec<(i32, f32, f32)> = pad.fingers.iter().chain(&pad.lifted).copied().collect();
             pad.let_go.clear();
             pad.lifted.clear();
-            (keys, pad.axes, fingers, pad.second_touch, pad.pad_used, pad.osh_pb)
+            (keys, pad.axes, fingers, pad.second_touch, pad.pad_used, pad.osh_pb, pad.motion)
         };
         if input::QUIT.load(std::sync::atomic::Ordering::Relaxed) {
             log::info!("asked to quit");
@@ -445,7 +447,7 @@ pub fn run(mut args: Vec<String>) {
         // a frame the panel will not show, which a title making a picture
         // every frame need not draw
         let cap = fixed_cap.unwrap_or(settings.frame_cap as f64);
-        let unshown = shown_only && probe.is_none() && settings.interpolate_to == 0 && frame_number + 1 < presented + (60.0 / cap).ceil() as u64;
+        let unshown = shown_only && as_played && settings.interpolate_to == 0 && frame_number + 1 < presented + (60.0 / cap).ceil() as u64;
         system.skip_frames(skip, unshown, most_skipped);
         let (mut buttons, circle_x, circle_y) = if hotkey { (Default::default(), 0.0, 0.0) } else { input::controls(&keys, &axes, &settings) };
         let (c_stick_x, c_stick_y) = if c_stick && !hotkey { (input::stick(axes[3]), -input::stick(axes[4])) } else { (0.0, 0.0) };
@@ -485,7 +487,7 @@ pub fn run(mut args: Vec<String>) {
         if probe.is_some() && script.is_empty() {
             system.set_input(InputState { buttons: probe::Probe::buttons(frame_number), ..Default::default() });
         } else if script.is_empty() {
-            system.set_input(InputState { buttons, circle_x, circle_y, c_stick_x, c_stick_y, touch: touching.then_some((cursor.0 as u16, cursor.1 as u16)), tilt });
+            system.set_input(InputState { buttons, circle_x, circle_y, c_stick_x, c_stick_y, touch: touching.then_some((cursor.0 as u16, cursor.1 as u16)), tilt, motion: motion.filter(|_| tilt == (0.0, 0.0)) });
         } else {
             system.set_input(scripted_input(&script, frame_number));
         }
@@ -565,11 +567,12 @@ pub fn run(mut args: Vec<String>) {
                 (last_fps, fps, fps_since) = (fps, 0, Instant::now());
             }
             let said = note.filter(|(_, at)| at.elapsed() < Duration::from_secs(2)).map(|(said, _)| said);
-            if second || said != status.as_ref().and_then(|status: &Status| status.note) {
+            let saving = zakuro_core::services::host_archive::saving();
+            if second || said != status.as_ref().and_then(|status: &Status| status.note) || saving != status.as_ref().is_some_and(|status| status.saving) {
                 let building = zakuro_gpu::compiling();
                 building_since = if building > 0 { building_since.or(Some(Instant::now())) } else { None };
                 let building = building_since.filter(|since| since.elapsed() >= Duration::from_secs(1)).map(|_| (building, zakuro_gpu::compiling_stand_ins()));
-                let now = Status::now(&settings, last_fps, said, building);
+                let now = Status::now(&settings, last_fps, said, building, saving);
                 if now != status {
                     overlay = now.as_ref().map(|now| {
                         let mut canvas = Canvas::new(&font, PANEL);

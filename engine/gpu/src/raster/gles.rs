@@ -487,13 +487,12 @@ struct Ring {
     mapped: Option<(*mut u8, [Option<glow::Fence>; 4])>,
 }
 
-/// whether rings are mapped for good: on Android, or with
-/// ZAKURO_PERSISTENT, where the driver has buffer storage.
+/// whether rings are mapped for good, where the driver has buffer storage,
+/// unless ZAKURO_NO_PERSISTENT: the R36S's Mali took 11 us a push to map and
+/// unmap, mario kart 7 4% slower.
 fn persistent(gl: &glow::Context) -> bool {
     static PERSISTENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *PERSISTENT.get_or_init(|| {
-        (cfg!(target_os = "android") || std::env::var_os("ZAKURO_PERSISTENT").is_some()) && gl.supported_extensions().contains("GL_EXT_buffer_storage")
-    })
+    *PERSISTENT.get_or_init(|| gl.supported_extensions().contains("GL_EXT_buffer_storage") && !crate::switch("ZAKURO_NO_PERSISTENT", "rings written through GL"))
 }
 
 impl Ring {
@@ -590,7 +589,9 @@ struct Texture {
     texture: glow::Texture,
     /// ETC1A4's alpha, which ETC1 leaves out.
     alpha: Option<glow::Texture>,
-    _texels: (Arc<[[u8; 4]]>, Option<crate::raster::Packed>),
+    /// what it was made from, which the texture cache holds while the
+    /// texture's memory stays the same.
+    texels: (Arc<[[u8; 4]]>, Option<crate::raster::Packed>),
     used: u64,
 }
 
@@ -696,6 +697,8 @@ impl<T> Pool<T> {
 
 static WORDS: Pool<u32> = Pool::new();
 static BYTES: Pool<u8> = Pool::new();
+static ARRAYS: Pool<Arc<[u8]>> = Pool::new();
+static SLOTS: Pool<(usize, Attribute)> = Pool::new();
 
 enum Submit {
     Triangles { viewport: [i32; 4], vertices: Vec<u8>, count: i32 },
@@ -916,12 +919,14 @@ impl DrawJob {
                             cache.viewport = Some(viewport);
                         }
                         if cache.cull != Some(cull) {
-                            match cull {
+                            // bit 2 a buffer upside down, its triangles wound
+                            // the other way round in the window
+                            match cull & 3 {
                                 0 => gl.disable(glow::CULL_FACE),
-                                cull => {
+                                mode => {
                                     gl.enable(glow::CULL_FACE);
-                                    gl.front_face(glow::CCW);
-                                    gl.cull_face(if cull == 1 { glow::FRONT } else { glow::BACK });
+                                    gl.front_face(if cull & 4 != 0 { glow::CW } else { glow::CCW });
+                                    gl.cull_face(if mode == 1 { glow::FRONT } else { glow::BACK });
                                 }
                             }
                             cache.cull = Some(cull);
@@ -988,8 +993,13 @@ impl DrawJob {
                                         gl.disable_vertex_attrib_array(slot);
                                     }
                                     local.cache.stride = None;
-                                    local.cache.resident = Some((key, slots));
+                                    if let Some((_, old)) = local.cache.resident.replace((key, slots)) {
+                                        SLOTS.give(old);
+                                    }
+                                } else {
+                                    SLOTS.give(slots);
                                 }
+                                ARRAYS.give(arrays);
                                 0
                             }
                             Attributes::Packed { bytes, stride } => {
@@ -1074,20 +1084,29 @@ impl std::ops::Deref for GlRef {
 /// spares the GPU shading the vertices of scenery out of view.
 #[derive(Default)]
 struct Occlusion {
-    meshes: rustc_hash::FxHashMap<u64, Hidden>,
+    meshes: rustc_hash::FxHashMap<u64, Copies>,
     free: Vec<glow::Query>,
+}
+
+/// a mesh's copies, the first drawn in a picture, the second and so on: a
+/// mesh the game draws in more than one place, as Super Mario 3D Land does
+/// its coins, blocks and enemies, is one mesh to the key, and one copy out
+/// of view left out all of them
+#[derive(Default)]
+struct Copies {
+    picture: u64,
+    drawn: usize,
+    /// how many the last two pictures drew
+    counts: [usize; 2],
+    copies: Vec<Hidden>,
 }
 
 #[derive(Default)]
 struct Hidden {
     query: Option<(glow::Query, u64)>,
     until: u64,
-    /// the picture it was last drawn in, and whether it was drawn twice in
-    /// one: a mesh the game draws in more than one place, as Super Mario 3D
-    /// Land does its coins, blocks and enemies, is the same mesh to the key,
-    /// and one of them out of view would leave out all of them
-    seen: Option<u64>,
-    shared: bool,
+    /// found on screen, drawn without a query until then
+    next: u64,
 }
 
 /// heavy draws left out and heavy draws looked at, for ZAKURO_GLES_TIMES.
@@ -1095,29 +1114,49 @@ static CULLED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::A
 
 /// pictures a mesh found off screen is left out for, two or three frames.
 const HIDDEN_PICTURES: u64 = 8;
+/// pictures one found on screen is drawn without a query: each query costs a
+/// tiled GPU's driver work, and what is on screen mostly stays there
+const SEEN_PICTURES: u64 = 4;
 
 impl Occlusion {
     /// whether to draw the mesh, and the query to draw it inside when it is
     /// tried again.
     /// SAFETY: on the GL thread
     unsafe fn check(&mut self, gl: &glow::Context, key: u64, picture: u64) -> (bool, Option<glow::Query>) {
-        if self.meshes.len() > 8192 {
-            self.meshes.retain(|_, mesh| mesh.query.is_some() || mesh.shared);
-        }
         let Occlusion { meshes, free } = self;
-        let mesh = meshes.entry(key).or_default();
-        if mesh.seen == Some(picture) {
-            mesh.shared = true;
+        if meshes.len() > 8192 {
+            meshes.retain(|_, mesh| {
+                let recent = mesh.picture + HIDDEN_PICTURES >= picture;
+                if !recent {
+                    free.extend(mesh.copies.drain(..).filter_map(|copy| copy.query.map(|(query, _)| query)));
+                }
+                recent
+            });
         }
-        mesh.seen = Some(picture);
-        if mesh.shared {
+        let copies = meshes.entry(key).or_default();
+        if copies.picture != picture {
+            copies.counts = [copies.drawn, copies.counts[0]];
+            (copies.picture, copies.drawn) = (picture, 0);
+        }
+        let index = copies.drawn;
+        copies.drawn += 1;
+        if copies.copies.len() <= index {
+            copies.copies.resize_with(index + 1, Hidden::default);
+        }
+        let stable = copies.counts[0] == copies.counts[1] && copies.drawn <= copies.counts[0];
+        let mesh = &mut copies.copies[index];
+        if !stable {
+            mesh.until = 0;
+            free.extend(mesh.query.take().map(|(query, _)| query));
             return (true, None);
         }
         unsafe {
             if let Some((query, tried)) = mesh.query {
-                if gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) != 0 {
+                if picture > tried && gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) != 0 {
                     if gl.get_query_parameter_u32(query, glow::QUERY_RESULT) == 0 {
                         mesh.until = tried + HIDDEN_PICTURES;
+                    } else {
+                        mesh.next = picture + SEEN_PICTURES;
                     }
                     free.push(query);
                     mesh.query = None;
@@ -1128,7 +1167,7 @@ impl Occlusion {
                 CULLED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return (false, None);
             }
-            if mesh.query.is_some() {
+            if mesh.query.is_some() || picture < mesh.next {
                 return (true, None);
             }
             let Some(query) = free.pop().or_else(|| gl.create_query().ok()) else { return (true, None) };
@@ -1803,6 +1842,20 @@ impl Gles {
             waiting.elapsed().as_secs_f64(),
             built
         );
+    }
+
+    /// a vertex program's variant for a buffer upside down, y turned over
+    /// where it leaves the program, under a hash of its own so that the
+    /// programs of buffers the right way up stay as they were.
+    fn flipped(&mut self, vertex: u64) -> u64 {
+        const FROM: &str = "gl_Position = vec4(position.xy,";
+        let flipped = vertex ^ 1 << 63;
+        if !self.vertex_sources.contains_key(&flipped) {
+            let Some(source) = self.vertex_sources.get(&vertex).filter(|source| source.contains(FROM)) else { return vertex };
+            let source = source.replace(FROM, "gl_Position = vec4(position.x, -position.y,");
+            self.vertex_sources.insert(flipped, source);
+        }
+        flipped
     }
 
     pub fn name(&self) -> &str {
@@ -2562,26 +2615,32 @@ impl Gles {
             let offset = t.input.checked_sub(s.addr).filter(|offset| offset % tile_rows == 0)? / tile_rows * step;
             (offset + first + rows <= s.height).then_some(offset)
         };
-        let Some((addr, input_size, row)) = self
+        let output_len = t.output_width * t.output_height * output_kind.bytes();
+        let Some((addr, input_size, row, drawn_under)) = self
             .surfaces
             .iter()
             .filter(|s| s.kind == input_kind && s.tiled == tiled && s.width == t.input_width)
             .filter_map(|s| Some((s, row_in(s)?)))
             .max_by_key(|(s, _)| (s.dirty.is_some(), s.height))
-            .map(|(s, row)| (s.addr, (s.width, s.height), row))
+            .map(|(s, row)| (s.addr, (s.width, s.height), row, s.dirty_overlaps(t.output, output_len)))
         else {
             return self.transfer_below_memory(memory, t);
         };
         let input_end = addr as u64 + (input_size.0 * input_size.1 * input_kind.bytes()) as u64;
-        let output_end = t.output as u64 + (t.output_width * t.output_height * output_kind.bytes()) as u64;
+        let output_end = t.output as u64 + output_len as u64;
         // a tiled output wider than the copy has its last row of tiles' end
         // left as it was, which may be the input's start: Yo-kai Watch 2
         // copies its 240 wide top screen into a texture 256 wide just before it
         let gap = if t.output_tiled && t.copy.0 < t.output_width && t.copy.1 == t.output_height { ((t.output_width - t.copy.0) * 8 * output_kind.bytes()) as u64 } else { 0 };
-        if (addr as u64) < output_end - gap && (t.output as u64) < input_end {
+        // or the output takes rows of the drawing nothing drew and the copy
+        // doesn't read, as RE:R and MH3U put their bottom screen just
+        // before the rows of the drawing they copy to it
+        let read = (addr as u64 + ((row + first) / step * tile_rows) as u64, addr as u64 + ((row + first + rows).div_ceil(step) * tile_rows) as u64);
+        let beside = !drawn_under && (read.1 <= t.output as u64 || output_end <= read.0);
+        if !beside && (addr as u64) < output_end - gap && (t.output as u64) < input_end {
             return Ok(false);
         }
-        let tail = ((addr as u64) < output_end && (t.output as u64) < input_end).then_some(gap as u32);
+        let tail = (!beside && (addr as u64) < output_end && (t.output as u64) < input_end).then_some(gap as u32);
         self.current()?;
         let (source, target) = loop {
             let source = self.surface_rows(memory, addr, input_size, input_kind, tiled, None)?;
@@ -3198,7 +3257,21 @@ impl Gles {
         let size = self.surfaces[index].size();
         let row = self.surfaces[index].row_bytes();
         let (from, to) = rows.map_or((addr, size), |(start, end)| (addr + start * row, (end - start) * row));
-        let others = self.adopt_all(index, from, to)?;
+        let mut others = self.adopt_all(index, from, to)?;
+        // a depth buffer a colour buffer is drawn over is another buffer's
+        // memory by now, as one a fill runs over is: Kid Icarus draws a small
+        // colour buffer where its scene's depth was, every frame
+        if matches!(self.surfaces[index].kind, Kind::Color(_)) && crate::fast_with(crate::speedup::CLEARS) {
+            for &other in &others {
+                let s = &mut self.surfaces[other];
+                if matches!(s.kind, Kind::Depth(_)) {
+                    s.shadow.resize(s.size() as usize, 0);
+                    memory.read(s.addr, &mut s.shadow);
+                    (s.dirty, s.checked, s.picture) = (None, false, None);
+                }
+            }
+            others.retain(|&other| !matches!(self.surfaces[other].kind, Kind::Depth(_)));
+        }
         if !others.is_empty() {
             self.write_back(memory, others)?;
         }
@@ -3687,7 +3760,15 @@ impl Gles {
         }
         let mut gone = Vec::new();
         self.textures.retain(|_, texture| {
-            let keep = flushes - texture.used < TEXTURE_KEEP_FLUSHES;
+            // one whose texels the cache let go of, for new ones at the same
+            // place, is never asked for again: a video's every picture would
+            // stay its 600 batches otherwise, memory running out on a 1 GB
+            // handheld
+            let replaced = match &texture.texels {
+                (_, Some((_, bytes))) => Arc::strong_count(bytes) == 1,
+                (texels, None) => Arc::strong_count(texels) == 1,
+            };
+            let keep = flushes - texture.used < TEXTURE_KEEP_FLUSHES && !replaced;
             if !keep {
                 gone.extend([Some(texture.texture), texture.alpha].into_iter().flatten());
             }
@@ -3814,9 +3895,11 @@ impl Gles {
         // with two waiting for the panel already, this one waits its turn:
         // dropped, its frame would have been drawn for nothing, where held
         // up, the title falls behind and skips drawing frames instead
+        let held = std::time::Instant::now();
         while self.presenting.load(std::sync::atomic::Ordering::Acquire) >= 2 {
             std::thread::sleep(std::time::Duration::from_micros(500));
         }
+        crate::PANEL_HELD.fetch_add(held.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         self.presenting.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let presenting = self.presenting.clone();
         let gl = self.gl;
@@ -4107,7 +4190,7 @@ impl Gles {
                 }
             }
         });
-        self.textures.insert(key, Texture { texture, alpha, _texels: (bound.texels.clone(), bound.packed.clone()), used: self.flushes });
+        self.textures.insert(key, Texture { texture, alpha, texels: (bound.texels.clone(), bound.packed.clone()), used: self.flushes });
         Ok((texture, alpha))
     }
 
@@ -4264,9 +4347,14 @@ impl Gles {
             Geometry::Shaded(shading) => self.vertex_stage(shading.unit, shading.semantics)?,
             Geometry::Triangles(_) => 0,
         };
+        // a buffer upside down: its vertex program's own variant, y turned
+        // over, the viewport mirrored and the winding with it. the CPU placed
+        // its own triangles that way already
+        let flip = matches!(draw.geometry, Geometry::Shaded(_)) && super::upside_down(draw.registers);
+        let vertex = if flip { self.flipped(vertex) } else { vertex };
 
         let (cull, count) = match draw.geometry {
-            Geometry::Shaded(shading) => (shading.cull, shading.indices.len()),
+            Geometry::Shaded(shading) => (shading.cull | (flip as u32) << 2, shading.indices.len()),
             Geometry::Triangles(triangles) => (0, triangles.len() * 3),
         };
         let r = draw.registers;
@@ -4445,7 +4533,13 @@ impl Gles {
         let writable = r[REG_DEPTH_STENCIL_WRITE] != 0;
         let depth_test = mask & 1 != 0;
         let depth_write = writable && mask & (1 << 12) != 0;
-        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && r[REG_STENCIL_TEST] & 1 != 0;
+        // the stencil's operations apply with its test's bit clear too, the
+        // test then passing always, see Stencil::read
+        let stencil_test = draw.depth.is_some_and(|(_, bytes)| bytes == 4) && super::Stencil::read(r, writable).is_some();
+        let stencil_compare = match r[REG_STENCIL_TEST] & 1 {
+            0 => r[REG_STENCIL_TEST] & !0x70 | 0x10,
+            _ => r[REG_STENCIL_TEST],
+        };
         let blend = (r[REG_COLOR_OPERATION] & 0x100 != 0).then_some(r[REG_BLEND_FUNC]);
         let mut color_mask = color_mask;
         match LogicOp::read(r) {
@@ -4480,22 +4574,21 @@ impl Gles {
             },
             Geometry::Shaded(shading) => {
                 let (x, y, width, height) = shading.viewport;
+                let y = if flip { draw.height as f32 - y - height } else { y };
                 let viewport = [(x * k).round() as i32, ((y + raise as f32) * k).round() as i32, (width * k).round() as i32, (height * k).round() as i32];
                 let shaded = timed(16);
                 let (uniforms, inputs, stride) = Self::shading_bytes(shading, depth_map);
                 let attributes = match shading.fetched {
                     Some(fetched) if crate::fast_with(crate::speedup::ARRAYS) => {
                         let read = shading.unit.inputs_read();
-                        let slots = (0..INPUT_REGISTERS)
-                            .filter(|r| read & (1 << r) != 0)
-                            .map(|register| match fetched.inputs[register] {
-                                Input::Array { array, offset, ty, count } => {
-                                    (array, Attribute::Array { offset: offset as usize, ty, count, stride: fetched.arrays[array].stride })
-                                }
-                                Input::Constant(value) => (0, Attribute::Constant(value)),
-                            })
-                            .collect();
-                        Attributes::Resident { arrays: fetched.arrays.iter().map(|array| array.bytes.clone()).collect(), slots }
+                        let mut slots = SLOTS.take(INPUT_REGISTERS);
+                        slots.extend((0..INPUT_REGISTERS).filter(|r| read & (1 << r) != 0).map(|register| match fetched.inputs[register] {
+                            Input::Array { array, offset, ty, count } => (array, Attribute::Array { offset: offset as usize, ty, count, stride: fetched.arrays[array].stride }),
+                            Input::Constant(value) => (0, Attribute::Constant(value)),
+                        }));
+                        let mut arrays = ARRAYS.take(fetched.arrays.len());
+                        arrays.extend(fetched.arrays.iter().map(|array| array.bytes.clone()));
+                        Attributes::Resident { arrays, slots }
                     }
                     Some(fetched) => {
                         let mut bytes = BYTES.take(fetched.arrays.iter().map(|array| array.bytes.len() + 16).sum());
@@ -4537,7 +4630,7 @@ impl Gles {
                     }
                 };
                 drop(shaded);
-                Submit::Shaded { viewport, cull: shading.cull, uniforms, attributes, indices, count: kept as i32, range, resident_indices }
+                Submit::Shaded { viewport, cull, uniforms, attributes, indices, count: kept as i32, range, resident_indices }
             }
         };
         static CULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4556,7 +4649,7 @@ impl Gles {
                 None
             },
             depth_mask: depth.is_some() && depth_write,
-            stencil: stencil_test.then(|| (r[REG_STENCIL_TEST], r[REG_STENCIL_OP] & 0x777, writable)),
+            stencil: stencil_test.then(|| (stencil_compare, r[REG_STENCIL_OP] & 0x777, writable)),
             bound,
             uniforms: words,
             vertex_array: self.vertex_array,
@@ -4813,6 +4906,30 @@ mod tests {
         assert_eq!(read_copy(&mut gles, &over), decoded(&memory, base, lead + drawn));
         // the drawing stayed on the GPU
         assert!(gles.surfaces.iter().any(|s| s.addr == drawing && s.dirty.is_some()));
+    }
+
+    #[test]
+    fn a_texture_the_cache_replaced_goes_with_its_batch() {
+        let mut gles = match Gles::new() {
+            Ok(gles) => gles,
+            Err(error) => {
+                eprintln!("no OpenGL ES here, skipped: {error}");
+                return;
+            }
+        };
+        let bound = |texels: Arc<[[u8; 4]]>| BoundTexture { texels, packed: None, drawn: None, linear: false, wrap_s: Wrap::ClampToEdge, wrap_t: Wrap::ClampToEdge, width: 8, height: 8, border: [0.0; 4], levels: 1, lod: Lod::default() };
+        // one the cache keeps, and a video's pictures, each held only until
+        // the next takes its place
+        let kept: Arc<[[u8; 4]]> = vec![[1, 2, 3, 4]; 64].into();
+        gles.texture(&bound(kept.clone())).unwrap();
+        for picture in 0..50u8 {
+            let texels: Arc<[[u8; 4]]> = vec![[picture; 4]; 64].into();
+            gles.texture(&bound(texels)).unwrap();
+            gles.worker.clone().run(|| ());
+            gles.end_batch();
+        }
+        assert_eq!(gles.textures.len(), 1, "the kept texture alone");
+        assert!(gles.textures.values().any(|texture| Arc::ptr_eq(&texture.texels.0, &kept)));
     }
 
     #[test]
