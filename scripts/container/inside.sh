@@ -76,7 +76,36 @@ if [ -s "/out/Pocket Native/pocket-native/games/$id/title.hints" ]; then
 fi
 overrides=()
 [ -d "titles/$id/overrides" ] && overrides=(--overrides "titles/$id/overrides")
-RECOMP_CFLAGS=-DRECOMP_FASTMEM CC=aarch64-linux-gnu-gcc-8 "$CARGO_TARGET_DIR/release/3dsrecomp" build "$game" "/work/recomp/$id" "${overrides[@]}"
+RECOMP_CFLAGS=-DRECOMP_FASTMEM RECOMP_A64=1 CC=aarch64-linux-gnu-gcc-8 "$CARGO_TARGET_DIR/release/3dsrecomp" build "$game" "/work/recomp/$id" "${overrides[@]}"
+
+echo "== finding the game's shaders"
+rm -rf /work/vertex
+# the title's own shader list first, a blank one where it has none, with
+# what the handheld built while it played, then every other title's, whose
+# lines count for the shaders this one shares
+titled=()
+if [ -n "${PN_PRECACHE:-}" ]; then
+    own="titles/$id/shaders.txt"
+    played="/out/Pocket Native/pocket-native/games/$id/data/shaders.txt"
+    if [ -f "$played" ]; then
+        rm -f "/work/played-$id.txt"
+        "$CARGO_TARGET_DIR/release/3dsrecomp" learn "$game" "$played" "/work/played-$id.txt" | tail -1 || true
+        if [ -f "/work/played-$id.txt" ]; then
+            # the list to share, its vertex shaders by key and no game data
+            mkdir -p "/out/Pocket Native/shaders to share"
+            cp "/work/played-$id.txt" "/out/Pocket Native/shaders to share/$id.txt"
+            ours=()
+            if [ -f "$own" ]; then ours=("$own"); fi
+            { head -1 "/work/played-$id.txt"; tail -q -n +2 "/work/played-$id.txt" "${ours[@]}" | sort -u; } > "/work/own-$id.txt"
+            own="/work/own-$id.txt"
+        fi
+    fi
+    titled=("$own")
+    for list in titles/*/shaders.txt; do
+        [ -f "$list" ] && [ "$list" != "titles/$id/shaders.txt" ] && titled+=("$list")
+    done
+fi
+"$CARGO_TARGET_DIR/release/3dsrecomp" shaders "$game" /work/vertex ${PN_PRECACHE:+precache} "${titled[@]}" | tail -5 || echo "none found, they get built as the game needs them"
 
 if [ ! -f /work/shared_font.bin ]; then
     echo "== making the system font"
@@ -117,7 +146,22 @@ for sysdata in "$pn"/games/*/sysdata; do
         cp /work/mii_placeholder.dat "$sysdata/CFL_Res.placeholder.dat"
     fi
 done
-cp "$game" "$pn/games/$id/game.3ds"
+# the card's padding left off, the image ending with its last partition, so
+# a 4 GB card fits a FAT32 card
+size=$(stat -c %s "$game")
+if [ "$(dd if="$game" bs=4 skip=64 count=1 2>/dev/null)" = NCSD ]; then
+    unit=$(( 0x200 << $(od -An -tu1 -j$((0x18E)) -N1 "$game") ))
+    end=0
+    for i in 0 1 2 3 4 5 6 7; do
+        read -r offset length < <(od -An -tu4 -j$((0x120 + 8 * i)) -N8 "$game")
+        (( offset + length > end )) && end=$(( offset + length ))
+    done
+    (( end > 0 && end * unit < size )) && size=$(( end * unit ))
+fi
+head -c "$size" "$game" > "$pn/games/$id/game.3ds"
+rm -rf "${pn:?}/games/${id:?}/vertex"
+[ -f /work/vertex/vertex.txt ] && mkdir -p "$pn/games/$id/vertex" && cp /work/vertex/vertex.txt /work/vertex/*.pica "$pn/games/$id/vertex/"
+[ -f /work/vertex/precache.txt ] && [ -d "$pn/games/$id/vertex" ] && cp /work/vertex/precache.txt "$pn/games/$id/vertex/"
 rm -f /work/game.*
 # FAT cards and Windows take no colons and a few other characters in a name
 launcher="$top/$(printf %s "${name:-$id}" | sed 's/: / - /g; s/[\\/:*?"<>|]//g').sh"

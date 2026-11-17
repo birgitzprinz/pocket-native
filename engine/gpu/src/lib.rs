@@ -5,6 +5,7 @@ pub mod blend;
 pub mod fog;
 pub mod proctex;
 pub mod format;
+pub mod pack;
 pub mod journal;
 pub mod lighting;
 pub mod raster;
@@ -16,10 +17,10 @@ pub mod texture;
 
 use format::ColorFormat;
 use registers::*;
-pub use overlay::{Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
+pub use overlay::{fitted, Overlay, OverlayMesh, OverlayTexture, OverlayVertex};
 pub use renderer::{DrawCall, Renderer, SoftwareRenderer};
 #[cfg(feature = "gles")]
-pub use raster::gles::{compiling, compiling_stand_ins, layout_scale, layout_size, note_compiler_crash, panel_timing, second_window, set_drops, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, set_window, stacked};
+pub use raster::gles::{compiling, compiling_stand_ins, preparing, skip_preparing, waited_draws, layout_scale, layout_size, note_compiler_crash, panel_timing, second_window, set_drops, set_second_shows_top, set_second_stretched, set_second_window, set_stacked, set_top_crop, set_window, stacked};
 
 /// how the GPU reaches guest memory.
 pub trait GpuMemory {
@@ -961,15 +962,23 @@ impl Gpu {
             return;
         }
 
-        let mut remaining = size;
-        let chunk = input_width.min(output_width);
-        let mut buffer = vec![0u8; chunk as usize];
-        while remaining >= chunk && chunk > 0 {
+        // one run of bytes, each side's lines ending where its own width
+        // says: MK7 copies lines of 4 KiB into one line of 128 KiB
+        let (mut remaining, mut input_left, mut output_left) = (size, input_width, output_width);
+        let mut buffer = Vec::new();
+        while remaining > 0 {
+            let step = remaining.min(input_left).min(output_left);
+            buffer.resize(step as usize, 0);
             memory.read(src, &mut buffer);
             memory.write(dst, &buffer);
-            src += input_width + input_skip;
-            dst += output_width + output_skip;
-            remaining -= chunk;
+            (src, dst, remaining) = (src + step, dst + step, remaining - step);
+            (input_left, output_left) = (input_left - step, output_left - step);
+            if input_left == 0 {
+                (src, input_left) = (src + input_skip, input_width);
+            }
+            if output_left == 0 {
+                (dst, output_left) = (dst + output_skip, output_width);
+            }
         }
         self.transfers += 1;
     }
@@ -1009,6 +1018,19 @@ impl Gpu {
         let name = format!("{} at {scale}x{shaded}", hardware.name());
         self.resources.hardware = Some(hardware);
         Ok(name)
+    }
+
+    /// draws the texture pack's pictures in place of the textures they
+    /// replace, or no pack's. only the host's GPU draws them, so a pack waits
+    /// for enable_hardware_renderer, and says whether it is drawn.
+    pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
+        #[cfg(feature = "gles")]
+        let pack = pack.filter(|_| self.resources.hardware.is_some());
+        #[cfg(not(feature = "gles"))]
+        let pack = pack.filter(|_| false);
+        let drawn = pack.is_some();
+        self.resources.textures.set_pack(pack);
+        drawn
     }
 
     /// the host's GPU for the panel alone, every draw left to the software
@@ -1868,6 +1890,21 @@ mod tests {
             let start = addr as usize;
             self.0[start..start + data.len()].copy_from_slice(data);
         }
+    }
+
+    #[test]
+    fn a_texture_copy_runs_on_across_lines_of_other_widths() {
+        let mut memory = FlatMemory((0..0x4000).map(|i| (i % 251) as u8).collect());
+        let mut gpu = Gpu::new();
+        // lines of 0x20 bytes into one line of 0x80, then the other way with
+        // a gap of 0x10 after each line written
+        gpu.texture_copy(&mut memory, 0x0000, 0x1000, 0x80, 0x2, 0x8);
+        assert_eq!(memory.0[0x1000..0x1080], memory.0[0x0000..0x0080]);
+        assert!(memory.0[0x1080..0x2000].iter().zip(0x1080..).all(|(&b, i)| b == (i % 251) as u8), "nothing written past the copy");
+        gpu.texture_copy(&mut memory, 0x2000, 0x3000, 0x40, 0x4, 0x0001_0001);
+        assert_eq!(memory.0[0x3000..0x3010], memory.0[0x2000..0x2010]);
+        assert_eq!(memory.0[0x3020..0x3030], memory.0[0x2010..0x2020]);
+        assert_eq!(memory.0[0x3040..0x3050], memory.0[0x2020..0x2030]);
     }
 
     /// the inverse of [shader::isa::decode_float24], for normal values.
