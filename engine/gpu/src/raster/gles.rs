@@ -143,6 +143,20 @@ fn word_bytes(words: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr().cast(), words.len() * 4) }
 }
 
+#[inline]
+fn append_input_bytes(bytes: &mut Vec<u8>, value: &[f32; 4]) {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: the four floats occupy 16 contiguous bytes in little-endian order.
+        let value = unsafe { std::slice::from_raw_parts(value.as_ptr().cast(), std::mem::size_of_val(value)) };
+        bytes.extend_from_slice(value);
+    }
+    #[cfg(target_endian = "big")]
+    for &value in value {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
 fn next_version() -> u64 {
     VERSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -973,8 +987,16 @@ impl DrawJob {
                                 local.resident.draws += 1;
                                 // the draw before's arrays read the same way,
                                 // the vertex array still has them
-                                let key: Vec<usize> = arrays.iter().map(|array| Arc::as_ptr(array) as *const u8 as usize).collect();
-                                if !local.cache.resident.as_ref().is_some_and(|(last, read)| *last == key && *read == slots) {
+                                let cached = local.cache.resident.as_ref().is_some_and(|(last, read)| {
+                                    *read == slots
+                                        && last.len() == arrays.len()
+                                        && last
+                                            .iter()
+                                            .zip(&arrays)
+                                            .all(|(&pointer, array)| pointer == Arc::as_ptr(array) as *const u8 as usize)
+                                });
+                                if !cached {
+                                    let key: Vec<usize> = arrays.iter().map(|array| Arc::as_ptr(array) as *const u8 as usize).collect();
                                     let buffers = arrays.iter().map(|array| local.resident.buffer(&gl, array)).collect::<Result<Vec<_>, String>>()?;
                                     for (slot, (array, attribute)) in slots.iter().enumerate() {
                                         let slot = slot as u32;
@@ -4800,9 +4822,7 @@ impl Gles {
         let mut inputs = BYTES.take((shading.inputs.len() * count).max(1) * 16);
         for input in shading.inputs {
             for register in registers() {
-                for value in input[register] {
-                    inputs.extend_from_slice(&value.to_le_bytes());
-                }
+                append_input_bytes(&mut inputs, &input[register]);
             }
         }
         if inputs.is_empty() {
@@ -4815,6 +4835,15 @@ impl Gles {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_vectors_are_packed_as_little_endian_floats() {
+        let value = [1.0, -2.0, 0.5, f32::from_bits(0x7FC0_1234)];
+        let mut bytes = Vec::new();
+        append_input_bytes(&mut bytes, &value);
+        let expected = value.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        assert_eq!(bytes, expected);
+    }
 
     #[test]
     fn subnative_scales_use_quarter_steps() {

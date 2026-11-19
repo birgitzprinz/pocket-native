@@ -321,9 +321,22 @@ fn guest(out: &mut String, w: &Writer, register: &str, at: u32) {
 
 /// a 32-bit constant into a register.
 fn constant(out: &mut String, register: &str, value: u32) {
-    emit!(out, "\tmovz {register}, #0x{:X}", value & 0xFFFF);
-    if value >> 16 != 0 {
-        emit!(out, "\tmovk {register}, #0x{:X}, lsl #16", value >> 16);
+    if bitmask(value) {
+        emit!(out, "\torr {register}, wzr, #0x{value:X}");
+        return;
+    }
+
+    let low = value & 0xFFFF;
+    let high = value >> 16;
+    match (low, high) {
+        (_, 0) => emit!(out, "\tmovz {register}, #0x{low:X}"),
+        (0, _) => emit!(out, "\tmovz {register}, #0x{high:X}, lsl #16"),
+        (_, 0xFFFF) => emit!(out, "\tmovn {register}, #0x{:X}", !low & 0xFFFF),
+        (0xFFFF, _) => emit!(out, "\tmovn {register}, #0x{:X}, lsl #16", !high & 0xFFFF),
+        _ => {
+            emit!(out, "\tmovz {register}, #0x{low:X}");
+            emit!(out, "\tmovk {register}, #0x{high:X}, lsl #16");
+        }
     }
 }
 
@@ -2360,6 +2373,26 @@ mod tests {
     /// program starts in it.
     const MODULE_BASE: u32 = 0x0DA5_C000;
     const MODULE_OFFSET: u32 = 0xFA0;
+
+    #[test]
+    fn constants_use_single_instruction_encodings_when_possible() {
+        let mut out = String::new();
+        constant(&mut out, "w0", 0xFF00_0000);
+        constant(&mut out, "w1", 0x1234_0000);
+        constant(&mut out, "w2", 0xFFFF_1234);
+        constant(&mut out, "w3", 0x1234_FFFF);
+        constant(&mut out, "w4", 0x1234_5678);
+
+        assert_eq!(
+            out,
+            "\torr w0, wzr, #0xFF000000\n\
+\tmovz w1, #0x1234, lsl #16\n\
+\tmovn w2, #0xEDCB\n\
+\tmovn w3, #0xEDCB, lsl #16\n\
+\tmovz w4, #0x5678\n\
+\tmovk w4, #0x1234, lsl #16\n"
+        );
+    }
 
     struct Random(u64);
 

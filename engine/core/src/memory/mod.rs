@@ -112,6 +112,14 @@ impl Memory {
         }
     }
 
+    #[inline(always)]
+    fn page_table_entry(table: &[*mut u8], addr: VAddr) -> *mut u8 {
+        let index = (addr >> PAGE_BITS) as usize;
+        // SAFETY: both page tables have PAGE_TABLE_ENTRIES entries and are
+        // never resized; this index is bounded by the 32-bit guest address.
+        unsafe { *table.get_unchecked(index) }
+    }
+
     pub fn with_linear_base(mut self, linear_base: VAddr) -> Memory {
         self.linear_base = linear_base;
         self
@@ -294,7 +302,7 @@ impl Memory {
             let bytes = value.to_le_bytes();
             for (i, byte) in bytes.iter().enumerate() {
                 let address = vaddr.wrapping_add(i as u32);
-                let ptr = self.read_table[(address >> PAGE_BITS) as usize];
+                let ptr = Self::page_table_entry(&self.read_table, address);
                 if ptr.is_null() {
                     return false;
                 }
@@ -304,7 +312,7 @@ impl Memory {
             return true;
         }
 
-        let ptr = self.read_table[(vaddr >> PAGE_BITS) as usize];
+        let ptr = Self::page_table_entry(&self.read_table, vaddr);
         if ptr.is_null() {
             return false;
         }
@@ -317,14 +325,14 @@ impl Memory {
 
     /// true when instructions may be fetched from vaddr.
     pub fn is_executable(&self, vaddr: VAddr) -> bool {
-        !self.read_table[(vaddr >> PAGE_BITS) as usize].is_null()
+        !Self::page_table_entry(&self.read_table, vaddr).is_null()
     }
 
     /// true when every page in the range is mapped and readable.
     pub fn is_readable(&self, vaddr: VAddr, size: u32) -> bool {
         (0..size.div_ceil(PAGE_SIZE)).all(|page| {
-            let index = ((vaddr.wrapping_add(page * PAGE_SIZE)) >> PAGE_BITS) as usize;
-            !self.read_table[index].is_null()
+            !Self::page_table_entry(&self.read_table, vaddr.wrapping_add(page * PAGE_SIZE))
+                .is_null()
         })
     }
 
@@ -446,7 +454,7 @@ impl Memory {
 
     #[inline(always)]
     fn page_read(&self, addr: VAddr) -> Option<&[u8]> {
-        let ptr = self.read_table[(addr >> PAGE_BITS) as usize];
+        let ptr = Self::page_table_entry(&self.read_table, addr);
         if ptr.is_null() {
             return None;
         }
@@ -457,7 +465,7 @@ impl Memory {
 
     #[inline(always)]
     fn page_write(&mut self, addr: VAddr) -> Option<&mut [u8]> {
-        let ptr = self.write_table[(addr >> PAGE_BITS) as usize];
+        let ptr = Self::page_table_entry(&self.write_table, addr);
         if ptr.is_null() {
             return None;
         }
